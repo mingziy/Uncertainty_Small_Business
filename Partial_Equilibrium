@@ -1,0 +1,561 @@
+% 19/09/2106
+% policy function iteration + howard improvement
+clc
+clear all
+version = 1;
+diary(['version' num2str(version) '.txt']);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%-------------------- Block 1: parameters (quarterly)----------------------
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% (1) incumbents
+% basic 
+alpha  = 0.25;
+beta   = 0.95^0.25;
+r_beta = 1/beta-1;
+delta  = 0.026; % depreciation rate
+
+%  adjustment cost term
+F_k   = 0;      % Disruption cost for investment
+S     = 0.33;    % Partial irreversibility resale cost for disinvestment
+psi_0 = 0;      % convex adjustment cost
+
+% financial friction parameters
+r_f   = 0.03/4; % risk free rate
+xi    = 0.1;    % default cost
+eta_1 = 0;   % costly equity finance
+
+
+% exogenous variables set up
+znum = 7; % idio prod
+anum = 5; % agg prod
+snum = 2; % volatility
+
+m = 4; % control the magnitude of volatiltiy 
+uncfreqLH = 0.026; % cond. prob of unc shock: low to high
+uncfreqHH = 0.943; % cond. prob of unc shock: high to high
+zjump     = 4.1;  % multiple of vol in idio case
+ajump     = 1.6;  % multiple of vol in agg case
+
+
+rhoz     = 0.95;
+sigmaz   = 0.05*m;
+zmin     = -4*(sigmaz^2/(1-rhoz^2))^0.5; % log min
+zmax     = 4*(sigmaz^2/(1-rhoz^2))^0.5;  % log max
+
+rhoa     = 0.95;
+sigmaa   = 0.0067*m;
+amin     = -2*(sigmaa^2/(1-rhoa^2))^0.5; % log min
+amax     = 2*(sigmaa^2/(1-rhoa^2))^0.5;  % log max
+
+
+% endogenous variables set up
+knum = 30;%10;
+bnum = 40;%20;
+kmin = 0.1;%1;
+kmax = ((delta)/(exp(zmax)*exp(amax)*alpha))^(1/(alpha-1));
+bmin = 50;%158;%130;%100;
+bmax = 1000;%250;%300;
+
+% calculate the states
+numendo = knum*bnum;
+numexog = znum*anum*snum;
+
+% (2) entrants
+C_e     = 35;  % entry cost
+epsilon = 1.7; % pareto distribution parameter of signal
+q_min   = 0.2; % signal min
+q_max   = 3;   % signal max
+qnum    = 30;  % signal grid
+rhoq    = rhoz; % persistence of signal
+sigmaq  = sigmaz;
+qjump   = zjump; 
+M       = 1; 
+% (3) iteration setup
+valtol = 1e-3; % value function iteration tolerance
+maxitr = 1000;  % max iterations
+
+% (4) simulations and IRF
+
+numsimIRF   = 1000; % number of shocked economies to simulate
+lengthIRF   = 100;  % length of each economy
+shockperIRF = 45;   % period in which to shock the economy
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%---------------- Block 2: Variable initialization/ Grid setups     -----------
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% (1) exog vars grid: , agg unc, idio prod, agg prod
+sigmazgrid = [sigmaz, zjump*sigmaz];
+sigmaagrid = [sigmaa, ajump*sigmaa];
+sigmaqgrid = [sigmaq, qjump*sigmaq];
+
+
+pr_mat_s(1,:) = [1-uncfreqLH,uncfreqLH];
+pr_mat_s(2,:) = [1-uncfreqHH,uncfreqHH];
+
+[zgrid, pr_mat_z,~] = tauchen2(zmin,zmax,rhoz,sigmazgrid,znum);
+zgrid = exp(zgrid);
+
+[agrid, pr_mat_a,~] = tauchen2(amin,amax,rhoa,sigmaagrid,anum);
+agrid = exp(agrid);
+
+qgrid  = linspace(log(q_min),log(q_max),qnum); % s_grid here is in log(s)
+pr_mat_q  = trans_Prob_sz(qgrid,log(zgrid),rhoq,sigmaqgrid,qnum); % transition probability
+qgrid  = exp(qgrid);
+
+
+% create unified transition matrix over exog vars for incumbents
+ct = 0;
+for zct = 1:znum
+    for act = 1:anum
+        for sct = 1:snum
+            ct = ct+1;
+            % indexing the exog vars
+            exog_pos(ct,1) = zct; exog_key(ct,1) = zgrid(zct);
+            exog_pos(ct,2) = act; exog_key(ct,2) = agrid(act);
+            exog_pos(ct,3) = sct; exog_key(ct,3) = sct; % 1 indicates low, 2 high
+            
+            % create the transition matrix 
+            primect = 0;
+            for zprimect = 1:znum
+                for aprimect = 1:anum
+                    for sprimect = 1:snum
+                        primect = primect+1;
+                        pr_mat(ct,primect)=pr_mat_z(zct,zprimect,sct)...
+                                          *pr_mat_a(act,aprimect,sct)...
+                                          *pr_mat_s(sct,sprimect);
+                    end
+                end
+            end
+          %
+        end
+    end
+end
+
+
+
+% create unified transition matrix over exog vars for entrants
+ct = 0;
+for qct = 1:qnum
+    for act = 1:anum
+        for sct = 1:snum
+            ct = ct+1;
+            
+            % indexing the exog vars for entrants
+            exog_pos_ent(ct,1) = qct; exog_key_ent(ct,1) = qgrid(qct);
+            exog_pos_ent(ct,2) = act; exog_key_ent(ct,2) = agrid(act);
+            exog_pos_ent(ct,3) = sct; exog_key_ent(ct,3) = sct; % 1 indicates low, 2 high
+  
+            
+            % create the transition matrix for entrants
+            primect = 0;
+            for zprimect = 1:znum
+                for aprimect = 1:anum
+                    for sprimect = 1:snum
+                        primect = primect+1;
+                        pr_mat_ent(ct,primect)=pr_mat_q(qct,zprimect,sct)...
+                                          *pr_mat_a(act,aprimect,sct)...
+                                          *pr_mat_s(sct,sprimect);
+                    end
+                end
+            end
+          %
+        end
+    end
+end
+
+
+% (2) endo vars grid: idio capital and debt
+kgrid = exp(linspace(log(kmin),log(kmax),knum));
+bgrid = exp(linspace(log(bmin),log(bmax),bnum));
+
+% index the endo variables (k,b)
+ct = 0;
+for kct = 1:knum
+    for bct = 1:bnum
+        ct = ct+1;
+        endog_pos(ct,1)=kct; endog_key(ct,1)=kgrid(kct);
+        endog_pos(ct,2)=bct; endog_key(ct,2)=bgrid(bct);
+    end
+end
+
+% (3) index for loop over value function V that depends only on current
+% exog vars and endo vars and debt price function q that depends on next
+% period endo vars and current exog vars
+ct = 0;
+
+for endogct = 1:numendo
+    for exogct = 1:numexog
+        ct = ct+1;
+        loopind(ct,1) = endogct; loopind(ct,2)=exogct;   
+    end
+end
+
+
+% index for loop over entrants' debt price function q that depends on next
+% period endo vars and current exog vars
+
+numexog_ent = qnum*anum*snum;
+ct = 0;
+for endogct = 1:numendo
+    for exogct = 1:numexog_ent
+        ct = ct+1;
+        loopind_ent(ct,1) = endogct; loopind_ent(ct,2)=exogct;   
+    end
+end
+
+% (5) recovery matrix                                                          
+parfor ct = 1:numendo*numexog
+    % extract index of endo state, exog state
+    endogct = loopind(ct,1);
+    exogct  = loopind(ct,2);
+    
+    % extract value of endo state, exog state
+    zval   = exog_key(exogct,1);
+    aval   = exog_key(exogct,2);
+    sval   = exog_key(exogct,3);
+        
+    kval   = endog_key(endogct,1);
+    bval   = endog_key(endogct,2);
+    
+    recmat_temp(ct) = (zval*aval*kval^alpha+(1-delta)*(1-xi)*kval)/bval;
+end
+ 
+for ct = 1:numendo*numexog
+    endogct = loopind(ct,1);
+    exogct  = loopind(ct,2);
+    recmat(endogct,exogct)= recmat_temp(ct);
+end
+
+recmat(find(recmat>=1))=1;
+
+%%
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%---------------- Block 3: Incumbents' optimization (PFI)      -----------
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% initialize the value function
+V_0 = zeros(numendo,numexog); 
+
+% default choice and debt pricing associated with this value function
+dftmat_0 = zeros(numendo,numexog); % default policy : 0 - not default; 1 - default
+qbmat_0  = ones(numendo,numexog)/(1+r_f); % corresponding debt price matrix
+
+% find the optimal policy using the current value function
+for ct = 1:numendo*numexog
+    endogct = loopind(ct,1);
+    exogct  = loopind(ct,2);
+    
+    zval   = exog_key(exogct,1);
+    aval   = exog_key(exogct,2);
+    sval   = exog_key(exogct,3);
+        
+    kval   = endog_key(endogct,1);
+    bval   = endog_key(endogct,2);
+    
+    invmat = endog_key(:,1)-kval*(1-delta);
+    ACK    = psi_0*invmat.^2/(2*kval)+ F_k*(zval*aval*kval^alpha);
+    ACK(find(invmat<0)) ...
+           = psi_0*invmat(find(invmat<0)).^2/(2*kval)+ F_k*(zval*aval*kval^alpha)-S*invmat(find(invmat<0));
+    
+    valuemat = zval*aval*kval^alpha -invmat - ACK ...
+        -bval + qbmat_0(:,exogct).*endog_key(:,2);
+    valuemat(find(valuemat<0))=valuemat(find(valuemat<0))*(1+eta_1);
+    
+    value = valuemat + beta*V_0*pr_mat(exogct,:)';
+    polmat_0(endogct,exogct) = find(value==max(value));
+end
+
+
+
+% ---- outer loop------
+iter_outer = 1;
+diff_outer = 1;
+
+while iter_outer < maxitr & diff_outer > valtol
+    tic
+    % ------inner loop ------
+    
+    for iter_inner = 1:50
+        VND_0 = V_0;
+        VND_0(find(dftmat_0==1))=0;
+        parfor ct = 1:numendo*numexog
+            %extract index of endo state, exog state and policy
+            endogct = loopind(ct,1);
+            exogct  = loopind(ct,2);
+            polct   = polmat_0(endogct,exogct);
+            
+            % extract value of endo state, exog state and policy choices
+            zval   = exog_key(exogct,1);
+            aval   = exog_key(exogct,2);
+            sval   = exog_key(exogct,3);
+            
+            kval   = endog_key(endogct,1);
+            bval   = endog_key(endogct,2);
+            
+            kprimeval = endog_key(polct,1);
+            bprimeval = endog_key(polct,2);
+            
+            inv = kprimeval-kval*(1-delta);
+            
+            % adjustment cost for capital:
+            if inv <0 % investment is subject to interruption cost: F_k*(zval*aval*kval^alpha)
+                ACK = psi_0*inv^2/(2*kval) + F_k*(zval*aval*kval^alpha)-S*inv;
+                
+            else % inv<0 : disinvestment is subject to resale cost: S*inv
+                
+                ACK = psi_0*inv^2/(2*kval) + F_k*(zval*aval*kval^alpha);
+            end
+            
+            equity = zval*aval*kval^alpha -inv - ACK...
+        -bval + qbmat_0(polct,exogct)*bprimeval;
+            
+            if equity < 0
+                
+                V_temp(ct) = equity*(1+eta_1)+ beta*VND_0(polct,:)*pr_mat(exogct,:)';
+            else
+                V_temp(ct) = equity+beta*VND_0(polct,:)*pr_mat(exogct,:)';
+            end
+        end
+        
+        for ct = 1:numendo*numexog
+            endogct = loopind(ct,1);
+            exogct  = loopind(ct,2);
+            V_0_1(endogct,exogct) = V_temp(ct);
+        end
+        V_0 = V_0_1;
+    end
+    
+    %--------------------end of inner loop ---------------------
+    % update the value function and optimal policies using the current value function
+    
+    % (1)default policy and debt pricing
+    
+    VND_0 = V_0;
+    VND_0(find(V_0<0)) = 0;
+    
+    dftmat_1 = zeros(numendo,numexog);
+    dftmat_1(find(V_0<0)) = 1;
+    
+    for ct = 1:numendo*numexog
+        endogct = loopind(ct,1);
+        exogct  = loopind(ct,2);
+        
+        qbmat_1(endogct,exogct) = (1-sum(dftmat_1(endogct,:).*pr_mat(exogct,:)))...
+            /(1+r_f-sum(recmat(endogct,:).*dftmat_1(endogct,:).*pr_mat(exogct,:)));
+    end
+    
+    
+    % (2)capital and debt policy
+    parfor ct = 1:numendo*numexog
+        endogct = loopind(ct,1);
+        exogct  = loopind(ct,2);
+        
+        zval   = exog_key(exogct,1);
+        aval   = exog_key(exogct,2);
+        sval   = exog_key(exogct,3);
+        
+        kval   = endog_key(endogct,1);
+        bval   = endog_key(endogct,2);
+        
+        invmat = endog_key(:,1)-kval*(1-delta);
+        ACK    = psi_0*invmat.^2/(2*kval)+ F_k*(zval*aval*kval^alpha);
+        ACK(find(invmat<0)) ...
+            = psi_0*invmat(find(invmat<0)).^2/(2*kval)+ F_k*(zval*aval*kval^alpha)-S*invmat(find(invmat<0));
+        
+        valuemat = zval*aval*kval^alpha -invmat - ACK ...
+        -bval + qbmat_1(:,exogct).*endog_key(:,2);
+    
+        valuemat(find(valuemat<0))= valuemat(find(valuemat<0))*(1+eta_1);
+        
+        value = valuemat + beta*VND_0*pr_mat(exogct,:)';
+        V_temp(ct) = max(value);
+        polmat_temp(ct) = find(value==max(value));
+    end
+    
+    for ct = 1:numendo*numexog
+        endogct = loopind(ct,1);
+        exogct  = loopind(ct,2);
+        V_1(endogct,exogct)      = V_temp(ct);
+        polmat_1(endogct,exogct) = polmat_temp(ct);
+    end
+    
+    diff_outer(iter_outer) = abs(max(V_1(:)-V_0(:)));
+    V_0      = V_1;
+    polmat_0 = polmat_1;
+    dftmat_0 = dftmat_1;
+    qbmat_0   = qbmat_1;
+    iter_outer = iter_outer + 1;
+    
+   
+toc
+end
+% ============ end of the outer loop ======================
+
+display(' ')
+display('convergence record:')
+display(num2str(diff_outer))
+
+
+% convert polmat to policies for capital and dent to see if they hit the
+% bound
+for endogct = 1:numendo
+    for exogct = 1:numexog
+        kprime_key(endogct,exogct)=endog_key(polmat_0(endogct,exogct),1);
+        bprime_key(endogct,exogct)=endog_key(polmat_0(endogct,exogct),2);
+        
+        kprime_pos(endogct,exogct)=endog_pos(polmat_0(endogct,exogct),1);
+        bprime_pos(endogct,exogct)=endog_pos(polmat_0(endogct,exogct),2);
+
+    end
+end
+
+if max(kprime_pos(:))==knum || min(kprime_pos(:))==1
+   display(' ')
+   display(['k hit the boundary:[',num2str(min(kprime_key(:))),',',num2str(max(kprime_key(:))),']'])
+end
+
+if  max(bprime_pos(:))==bnum || min(bprime_pos(:))==1
+    display(' ')
+   display(['b hit the boundary:[',num2str(min(bprime_key(:))),',',num2str(max(bprime_key(:))),']'])
+end
+    
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%---------------- Block 4: Graph policy functions      -----------
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+for ct = 1:numendo*numexog
+    endogct = loopind(ct,1);
+    exogct  = loopind(ct,2);
+    
+    zind   = exog_pos(exogct,1);
+    aind   = exog_pos(exogct,2);
+    sind   = exog_pos(exogct,3);
+        
+    kind   = endog_pos(endogct,1);
+    bind   = endog_pos(endogct,2);
+    
+    kpol(kind,bind,zind,aind,sind) = kprime_key(endogct,exogct);
+    bpol(kind,bind,zind,aind,sind) = bprime_key(endogct,exogct);
+    dftpol(kind,bind,zind,aind,sind) = dftmat_1(endogct,exogct);
+    qbpol(kind,bind,zind,aind,sind)  = qbmat_1(endogct,exogct);
+    Vfun(kind,bind,zind,aind,sind)  = V_1(endogct,exogct);
+end
+
+
+cc = [0,0,0;0,0,1;0,1,1;0,1,0;1,0,0;1,0,1];
+
+figure % debt price
+for zind = 1:5
+    plot(bgrid,qbpol(1,:,zind,5,1),'color',cc(zind,:))
+    hold on
+    plot(bgrid,qbpol(1,:,zind,5,2),'--','color',cc(zind,:))
+    xlim([50,400])
+end
+title('Debt Price')
+print('Debt_Price','-depsc')
+
+
+figure % debt 
+for zind = 1:5
+    plot(bgrid,bpol(end,:,zind,5,1),'color',cc(zind,:))
+    hold on
+    plot(bgrid,bpol(end,:,zind,5,2),'--','color',cc(zind,:))
+end
+title('Debt Choice')
+print('Debt_Choice','-depsc')
+
+figure % capital
+for zind = 1:5
+    plot(kgrid,kpol(:,end,zind,5,1),'color',cc(zind,:))
+    hold on
+    plot(kgrid,kpol(:,end,zind,5,2),'--','color',cc(zind,:))
+end
+title('Capital Choice')
+print('Capital_Choice','-depsc')
+
+
+
+figure % Value function
+for zind = 1:5
+    plot(Vfun(:,1,zind,1,1),'color',cc(zind,:))
+    hold on
+    plot(Vfun(:,1,zind,1,2),'--','color',cc(zind,:))
+end
+title('Incumbent''s Value Function')
+print('Incumbent_Value_Function','-depsc')
+
+
+%%
+
+
+% (1) Generate the debt price for entrants
+
+
+for ct = 1:numendo*numexog_ent
+    endogct = loopind_ent(ct,1);
+    exogct  = loopind_ent(ct,2);
+    
+    qbmat_ent(endogct,exogct) = (1-sum(dftmat_1(endogct,:).*pr_mat_ent(exogct,:)))...
+        /(1+r_f-sum(recmat(endogct,:).*dftmat_1(endogct,:).*pr_mat_ent(exogct,:)));
+end
+
+% (2) generate value function for entrants
+
+VND = V_1;
+VND(find(V_1<0))=0;
+
+for ct = 1:numexog_ent
+    
+    valuemat = -endog_key(:,1) + qbmat_ent(:,ct).*endog_key(:,2);
+    valuemat(find(valuemat<0))=valuemat(find(valuemat<0))*(1+eta_1);
+    
+    value = valuemat + beta*VND*pr_mat_ent(ct,:)';
+    V_ent(ct) = max(value);
+    polmat_ent(ct) = find(value==V_ent(ct));
+end
+
+% convert polmat_ent to policies for capital and dent to see if they hit the
+% bound
+
+    for exogct = 1:numexog_ent
+        kprime_key_ent(exogct)=endog_key(polmat_ent(exogct),1);
+        bprime_key_ent(exogct)=endog_key(polmat_ent(exogct),2);
+        
+        kprime_pos_ent(exogct)=endog_pos(polmat_ent(exogct),1);
+        bprime_pos_ent(exogct)=endog_pos(polmat_ent(exogct),2);
+
+    end
+    
+    
+    % graph the policy function
+
+for ct = 1:numexog_ent
+    
+    qind   = exog_pos_ent(ct,1);
+    aind   = exog_pos_ent(ct,2);
+    sind   = exog_pos_ent(ct,3);
+        
+    
+    kpol_ent(qind,aind,sind) = kprime_key_ent(ct);
+    bpol_ent(qind,aind,sind) = bprime_key_ent(ct);
+    V_ent_fun(qind,aind,sind)= V_ent(ct);
+end
+
+
+figure % value function
+for zind = 1:znum
+    plot(V_ent_fun(:,3,1))
+    hold on
+    plot(V_ent_fun(:,3,2),'--')
+end
+title('Entrant''s Value Function')
+print('Entrant_Value_Function','-depsc')
+
+
+save(['Version',num2str(version),'.mat'])
